@@ -9,10 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import unescape
 from typing import List, Optional
-from urllib.parse import quote_plus, unquote_plus
+from urllib.parse import quote_plus, unquote_plus, urlencode, urlparse
 
 import aiohttp
-import feedparser
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -41,27 +40,27 @@ except Exception:
     pass
 
 # ==============================================================
-# СПЕЦЦЕНТР NEWS BOT — версия с Claude AI и редактором
-# ==============================================================
+# СПЕЦЦЕНТР NEWS BOT
 # Режимы:
-#   python speccentr_news_bot.py fetch   — собрать новости, написать статью
-#                                          через Claude, отправить владельцу
-#   python speccentr_news_bot.py poll    — слушать кнопки и заявки клиентов
-#   python speccentr_news_bot.py all     — fetch + poll одновременно
+#   python speccentr_news_bot.py fetch  — найти новости через DuckDuckGo,
+#                                         написать статью через Claude,
+#                                         отправить владельцу на проверку
+#   python speccentr_news_bot.py poll   — слушать кнопки и заявки клиентов
+#   python speccentr_news_bot.py all    — fetch + poll одновременно
 # ==============================================================
 
-BOT_TOKEN       = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID      = os.getenv("CHANNEL_ID", "").strip()
-OWNER_CHAT_ID   = os.getenv("OWNER_CHAT_ID", "").strip()
-BOT_USERNAME    = os.getenv("BOT_USERNAME", "").strip()
-ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY", "").strip()
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "").strip()
+BOT_USERNAME  = os.getenv("BOT_USERNAME", "").strip()
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
-DB_PATH             = os.getenv("DB_PATH", "news_bot.db")
-FETCH_TIMEOUT       = int(os.getenv("FETCH_TIMEOUT", "25"))
-MAX_POSTS_PER_RUN   = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
-DRY_RUN             = os.getenv("DRY_RUN", "0") == "1"
-COMPANY_NAME        = os.getenv("COMPANY_NAME", "СпецЦентр")
-CONTACT_TEXT        = os.getenv(
+DB_PATH           = os.getenv("DB_PATH", "news_bot.db")
+FETCH_TIMEOUT     = int(os.getenv("FETCH_TIMEOUT", "25"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
+DRY_RUN           = os.getenv("DRY_RUN", "0") == "1"
+COMPANY_NAME      = os.getenv("COMPANY_NAME", "СпецЦентр")
+CONTACT_TEXT      = os.getenv(
     "CONTACT_TEXT",
     "Напишите нам — подберём программу обучения под ваш объект и должности.",
 )
@@ -70,34 +69,34 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("speccentr-bot")
 
 
+# ==============================================================
+# ДАННЫЕ
+# ==============================================================
 @dataclass
 class NewsItem:
     source: str
     title: str
     url: str
-    summary: str
-    published_at: Optional[datetime] = None
+    snippet: str
     raw_text: str = ""
 
 
-RSS_SOURCES = [
-    ("Минтруд", "https://mintrud.gov.ru/news/rss"),
-]
-
-HTML_SOURCES = [
-    {"name": "Минтруд / Охрана труда",  "url": "https://mintrud.gov.ru/labour/safety",
-     "item_selector": "a", "href_must_contain": "/labour/safety/"},
-    {"name": "Роструд / Новости",        "url": "https://rostrud.gov.ru/press_center/novosti/",
-     "item_selector": "a", "href_must_contain": "/press_center/novosti/"},
-    {"name": "МЧС / Новости",            "url": "https://mchs.gov.ru/deyatelnost/press-centr/novosti",
-     "item_selector": "a", "href_must_contain": "/deyatelnost/press-centr/novosti/"},
-    {"name": "Минобрнауки / Новости",    "url": "https://minobrnauki.gov.ru/press-center/news/",
-     "item_selector": "a", "href_must_contain": "/press-center/news/"},
+# Поисковые запросы — по одному на каждую услугу
+SEARCH_QUERIES = [
+    "охрана труда изменения требования 2025 2026",
+    "пожарная безопасность новые требования 2025 2026",
+    "промышленная безопасность ростехнадзор 2025 2026",
+    "работы на высоте требования изменения 2025",
+    "СИЗ средства индивидуальной защиты требования 2025",
+    "первая помощь на производстве требования 2025",
+    "электробезопасность персонал требования 2025",
+    "газоопасные работы требования 2025",
+    "гражданская оборона ЧС требования 2025",
 ]
 
 SERVICE_RULES = [
     {"service": "Обучение по охране труда (А, Б, В)", "tag": "#охрана_труда", "weight": 6,
-     "keywords": ["охрана труда","система управления охраной труда","профессиональных рисков",
+     "keywords": ["охрана труда","управление охраной труда","профессиональных рисков",
                   "инструктаж","безопасным методам","программа а","программа б","программа в"]},
     {"service": "Обучение по применению СИЗ", "tag": "#сиз", "weight": 6,
      "keywords": ["сиз","средств индивидуальной защиты","применению сиз"]},
@@ -182,7 +181,8 @@ def save_draft(conn, h, article, service, tag, url, title, msg_id):
     conn.commit()
 
 def update_draft(conn, h, article, msg_id):
-    conn.execute("UPDATE pending_drafts SET article=?,tg_message_id=? WHERE hash=?", (article, msg_id, h))
+    conn.execute("UPDATE pending_drafts SET article=?,tg_message_id=? WHERE hash=?",
+                 (article, msg_id, h))
     conn.commit()
 
 def get_draft(conn, h):
@@ -199,12 +199,13 @@ def delete_draft(conn, h):
 
 def mark_posted(conn, h, title, url, service):
     conn.execute(
-        "INSERT OR IGNORE INTO published_news (hash,source,title,url,service,published_at,created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO published_news "
+        "(hash,source,title,url,service,published_at,created_at) VALUES (?,?,?,?,?,?,?)",
         (h,"канал",title,url,service,None,datetime.now(timezone.utc).isoformat()))
     conn.commit()
 
-def save_lead(conn, tg_user_id, username, full_name, topic, company, contact_name, phone, comment):
+def save_lead(conn, tg_user_id, username, full_name, topic,
+              company, contact_name, phone, comment):
     conn.execute(
         "INSERT INTO leads (created_at,tg_user_id,username,full_name,topic,"
         "source_post,company,contact_name,phone,comment) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -222,7 +223,8 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 def he(text: str) -> str:
-    return (text or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
+    return (text or "").replace("&","&amp;").replace("<","&lt;") \
+                       .replace(">","&gt;").replace('"',"&quot;")
 
 def detect_service(text: str) -> tuple[str, str, int]:
     txt = (text or "").lower()
@@ -245,12 +247,150 @@ def build_deep_link(service: str) -> str:
 
 def get_lead_topic(service: str) -> str:
     s = service.lower()
-    for kw, topic in [("охране труда","Охрана труда"),("пожар","Пожарная безопасность"),
-                      ("высоте","Работы на высоте"),("промышлен","Промышленная безопасность"),
-                      ("первой помощи","Первая помощь"),("сиз","СИЗ"),("рабочих","Рабочие профессии")]:
+    for kw, topic in [
+        ("охране труда","Охрана труда"), ("пожар","Пожарная безопасность"),
+        ("высоте","Работы на высоте"), ("промышлен","Промышленная безопасность"),
+        ("первой помощи","Первая помощь"), ("сиз","СИЗ"),
+        ("рабочих","Рабочие профессии"),
+    ]:
         if kw in s:
             return topic
     return "Другая программа"
+
+
+# ==============================================================
+# ПОИСК ЧЕРЕЗ DUCKDUCKGO
+# ==============================================================
+async def ddg_search(query: str, max_results: int = 5) -> List[dict]:
+    """
+    Ищет через DuckDuckGo HTML (без API ключа).
+    Возвращает список {"title": ..., "url": ..., "snippet": ...}
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
+    params = {"q": query, "kl": "ru-ru", "kad": "ru_RU"}
+    url = "https://html.duckduckgo.com/html/?" + urlencode(params)
+
+    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(url, timeout=timeout) as resp:
+                resp.raise_for_status()
+                html = await resp.text()
+    except Exception as e:
+        logger.warning("DuckDuckGo поиск '%s': %s", query, e)
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+
+    for result in soup.select(".result")[:max_results]:
+        title_el = result.select_one(".result__title a")
+        snippet_el = result.select_one(".result__snippet")
+        if not title_el:
+            continue
+
+        title = normalize(title_el.get_text())
+        snippet = normalize(snippet_el.get_text()) if snippet_el else ""
+
+        # Извлекаем реальный URL из редиректа DDG
+        href = title_el.get("href", "")
+        if "uddg=" in href:
+            from urllib.parse import parse_qs, urlparse as _urlparse
+            qs = parse_qs(_urlparse(href).query)
+            href = qs.get("uddg", [href])[0]
+        elif href.startswith("/"):
+            href = "https://duckduckgo.com" + href
+
+        if not title or not href:
+            continue
+
+        results.append({"title": title, "url": href, "snippet": snippet})
+
+    logger.info("DuckDuckGo '%s': найдено %d результатов", query, len(results))
+    return results
+
+
+async def fetch_article_text(url: str) -> str:
+    """Скачивает страницу и извлекает основной текст."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=timeout,
+                                   allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return ""
+                html = await resp.text(errors="replace")
+        soup = BeautifulSoup(html, "lxml")
+        for tag in soup(["script","style","noscript","nav","footer","header"]):
+            tag.decompose()
+        return normalize(soup.get_text(" ", strip=True))[:3000]
+    except Exception as e:
+        logger.warning("Не удалось прочитать %s: %s", url, e)
+        return ""
+
+
+async def collect_news() -> List[tuple]:
+    """
+    Ищет новости через DuckDuckGo по каждому запросу,
+    фильтрует по ключевым словам услуг.
+    """
+    seen_urls: set = set()
+    results: List[tuple] = []  # (NewsItem, service, tag, score)
+
+    for query in SEARCH_QUERIES:
+        hits = await ddg_search(query, max_results=5)
+        await asyncio.sleep(2)  # пауза между запросами чтобы не получить бан
+
+        for hit in hits:
+            url = hit["url"]
+            title = hit["title"]
+            snippet = hit["snippet"]
+
+            if not url or not title or url in seen_urls:
+                continue
+
+            # Фильтруем мусорные домены
+            domain = urlparse(url).netloc.lower()
+            if any(skip in domain for skip in ["youtube","vk.com","ok.ru","instagram","facebook"]):
+                continue
+
+            seen_urls.add(url)
+
+            # Быстрая проверка по заголовку и сниппету
+            service, tag, score = detect_service(f"{title} {snippet}")
+            if score < 5 or not service:
+                continue
+
+            # Читаем полный текст статьи
+            raw_text = await fetch_article_text(url)
+            if raw_text:
+                # Пересчитываем score с полным текстом
+                service, tag, score = detect_service(f"{title} {snippet} {raw_text}")
+                if score < 5 or not service:
+                    continue
+
+            item = NewsItem(
+                source=domain,
+                title=title,
+                url=url,
+                snippet=snippet,
+                raw_text=raw_text,
+            )
+            results.append((item, service, tag, score))
+
+        if len(results) >= MAX_POSTS_PER_RUN * 3:
+            break
+
+    # Сортируем по score
+    results.sort(key=lambda p: p[3], reverse=True)
+    logger.info("Найдено релевантных новостей: %d", len(results))
+    return results
 
 
 # ==============================================================
@@ -259,7 +399,7 @@ def get_lead_topic(service: str) -> str:
 async def call_claude(prompt: str) -> str:
     if not ANTHROPIC_KEY:
         logger.warning("ANTHROPIC_API_KEY не задан — возвращаю заглушку")
-        return prompt[:800]
+        return prompt[:600]
 
     headers = {
         "x-api-key": ANTHROPIC_KEY,
@@ -279,15 +419,17 @@ async def call_claude(prompt: str) -> str:
         ) as resp:
             if resp.status != 200:
                 logger.error("Claude API %s: %s", resp.status, await resp.text())
-                return prompt[:800]
+                return prompt[:600]
             data = await resp.json()
             return data["content"][0]["text"].strip()
 
 
-async def generate_article(news_text: str, service: str, source_url: str) -> str:
-    prompt = f"""Ты контент-менеджер учебного центра «СпецЦентр» (охрана труда, пожарная безопасность, промбезопасность).
+async def generate_article(item: NewsItem, service: str) -> str:
+    news_text = f"{item.title}\n\n{item.raw_text or item.snippet}"
+    prompt = f"""Ты контент-менеджер учебного центра «СпецЦентр» \
+(охрана труда, пожарная безопасность, промбезопасность).
 
-Вот новость от государственного ведомства:
+Вот найденная новость:
 ---
 {news_text[:3000]}
 ---
@@ -300,9 +442,9 @@ async def generate_article(news_text: str, service: str, source_url: str) -> str
   2. Суть новости — что изменилось или вводится
   3. Кому важно (руководитель, специалист по ОТ, ответственный за безопасность)
   4. Что нужно сделать — конкретный призыв проверить/пройти обучение
-  5. <a href="{source_url}">Читать источник</a>
+  5. <a href="{he(item.url)}">Читать источник</a>
 - Актуальная услуга: {service}
-- В конце: 📩 <b>{he(CONTACT_TEXT)}</b>
+- В конце строго: 📩 <b>{he(CONTACT_TEXT)}</b>
 - Без хэштегов (добавятся автоматически)
 - Живо и по-деловому, без канцелярита
 
@@ -310,126 +452,27 @@ async def generate_article(news_text: str, service: str, source_url: str) -> str
     return await call_claude(prompt)
 
 
-async def regenerate_article(original_article: str, service: str,
+async def regenerate_article(draft_article: str, service: str,
                               source_url: str, editor_comment: str) -> str:
     prompt = f"""Ты контент-менеджер учебного центра «СпецЦентр».
 
 Текущий черновик поста:
 ---
-{original_article[:3000]}
+{draft_article[:3000]}
 ---
 
 Редактор просит внести правки:
 "{editor_comment}"
 
-Напиши обновлённый пост с учётом правок. Те же требования:
+Напиши обновлённый пост с учётом правок. Требования:
 - Длина 150–300 слов, HTML-разметка Telegram
 - Услуга: {service}
-- Ссылка: <a href="{source_url}">Читать источник</a>
-- В конце: 📩 <b>{he(CONTACT_TEXT)}</b>
+- Ссылка: <a href="{he(source_url)}">Читать источник</a>
+- В конце строго: 📩 <b>{he(CONTACT_TEXT)}</b>
 - Без хэштегов
 
 Верни ТОЛЬКО текст поста."""
     return await call_claude(prompt)
-
-
-# ==============================================================
-# ПАРСИНГ
-# ==============================================================
-async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
-    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
-    async with session.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-        resp.raise_for_status()
-        return await resp.text()
-
-async def fetch_rss(session, name, rss_url) -> List[NewsItem]:
-    logger.info("RSS: %s", rss_url)
-    text = await fetch_text(session, rss_url)
-    feed = feedparser.parse(text)
-    items = []
-    for entry in feed.entries:
-        pub = None
-        if getattr(entry, "published_parsed", None):
-            pub = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-        summary = normalize(getattr(entry, "summary", "") or getattr(entry, "description", ""))
-        items.append(NewsItem(
-            source=name, title=normalize(getattr(entry, "title", "")),
-            url=getattr(entry, "link", ""), summary=summary,
-            published_at=pub, raw_text=summary,
-        ))
-    return items
-
-async def fetch_article(session, url) -> str:
-    try:
-        html = await fetch_text(session, url)
-        soup = BeautifulSoup(html, "lxml")
-        for tag in soup(["script","style","noscript"]):
-            tag.decompose()
-        return normalize(soup.get_text(" ", strip=True))[:3000]
-    except Exception as e:
-        logger.warning("Не удалось прочитать %s: %s", url, e)
-        return ""
-
-async def fetch_html_source(session, cfg) -> List[NewsItem]:
-    logger.info("HTML: %s", cfg["url"])
-    html = await fetch_text(session, cfg["url"])
-    soup = BeautifulSoup(html, "lxml")
-    items, seen = [], set()
-    for a in soup.select(cfg["item_selector"]):
-        href = (a.get("href") or "").strip()
-        title = normalize(a.get_text(" ", strip=True))
-        if not href or not title:
-            continue
-        if cfg.get("href_must_contain") and cfg["href_must_contain"] not in href:
-            continue
-        if title in seen:
-            continue
-        seen.add(title)
-        if href.startswith("/"):
-            base = cfg["url"].split("//", 1)
-            href = base[0] + "//" + base[1].split("/", 1)[0] + href
-        items.append(NewsItem(source=cfg["name"], title=title, url=href, summary=""))
-        if len(items) >= 20:
-            break
-    for item in items:
-        item.raw_text = await fetch_article(session, item.url)
-        item.summary = item.raw_text[:400]
-    return items
-
-async def collect_news() -> List[tuple]:
-    items: List[NewsItem] = []
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        for name, url in RSS_SOURCES:
-            try:
-                items.extend(await fetch_rss(session, name, url))
-            except Exception as e:
-                logger.error("RSS %s: %s", url, e)
-        for cfg in HTML_SOURCES:
-            try:
-                items.extend(await fetch_html_source(session, cfg))
-            except Exception as e:
-                logger.error("HTML %s: %s", cfg["url"], e)
-
-    seen_urls: set = set()
-    clean = []
-    for item in items:
-        if not item.title or not item.url or item.url in seen_urls:
-            continue
-        seen_urls.add(item.url)
-        clean.append(item)
-
-    scored = []
-    for item in clean:
-        service, tag, score = detect_service(f"{item.title} {item.summary} {item.raw_text}")
-        if score >= 5 and service:
-            scored.append((item, service, tag, score))
-
-    scored.sort(
-        key=lambda p: (p[0].published_at or datetime(2000, 1, 1, tzinfo=timezone.utc), p[3]),
-        reverse=True,
-    )
-    return scored
 
 
 # ==============================================================
@@ -473,9 +516,8 @@ async def run_fetch() -> None:
     conn = db_connect()
 
     try:
-        logger.info("Собираю новости...")
+        logger.info("Ищу новости через DuckDuckGo...")
         scored = await collect_news()
-        logger.info("Релевантных: %d", len(scored))
 
         sent = 0
         for item, service, tag, _score in scored:
@@ -484,8 +526,7 @@ async def run_fetch() -> None:
                 continue
 
             logger.info("Генерирую статью: %s", item.title)
-            full_text = f"{item.title}\n\n{item.raw_text or item.summary}"
-            article = await generate_article(full_text, service, item.url)
+            article = await generate_article(item, service)
             article_with_tag = f"{article}\n\n{tag} #спеццентр"
 
             preview = (
@@ -498,14 +539,16 @@ async def run_fetch() -> None:
 
             if DRY_RUN:
                 logger.info("DRY RUN:\n%s", preview)
-                save_draft(conn, h, article_with_tag, service, tag, item.url, item.title, 0)
+                save_draft(conn, h, article_with_tag, service, tag,
+                           item.url, item.title, 0)
             else:
                 msg = await bot.send_message(
                     chat_id=OWNER_CHAT_ID,
                     text=preview,
                     reply_markup=draft_keyboard(h),
                 )
-                save_draft(conn, h, article_with_tag, service, tag, item.url, item.title, msg.message_id)
+                save_draft(conn, h, article_with_tag, service, tag,
+                           item.url, item.title, msg.message_id)
                 logger.info("Отправлено на проверку: %s (msg=%d)", item.title, msg.message_id)
 
             sent += 1
@@ -533,6 +576,9 @@ async def start_polling() -> None:
     dp = Dispatcher()
     conn = db_connect()
 
+    # ---- Сброс вебхука при старте чтобы избежать Conflict ----
+    await bot.delete_webhook(drop_pending_updates=True)
+
     @dp.callback_query(F.data.startswith("pub:"))
     async def cb_publish(callback: CallbackQuery) -> None:
         if str(callback.from_user.id) != OWNER_CHAT_ID:
@@ -550,7 +596,7 @@ async def start_polling() -> None:
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.reply("✅ Опубликовано в канал!")
         await callback.answer()
-        logger.info("Опубликовано: %s", h)
+        logger.info("Опубликовано: %s", h[:12])
 
     @dp.callback_query(F.data.startswith("edit:"))
     async def cb_edit(callback: CallbackQuery) -> None:
@@ -695,9 +741,9 @@ async def main() -> None:
     if len(sys.argv) < 2:
         print(
             "Использование:\n"
-            "  python speccentr_news_bot.py fetch   — собрать новости и отправить черновики\n"
-            "  python speccentr_news_bot.py poll    — слушать кнопки и заявки\n"
-            "  python speccentr_news_bot.py all     — fetch + poll одновременно"
+            "  python speccentr_news_bot.py fetch  — найти новости и отправить черновики\n"
+            "  python speccentr_news_bot.py poll   — слушать кнопки и заявки\n"
+            "  python speccentr_news_bot.py all    — fetch + poll одновременно"
         )
         return
     mode = sys.argv[1].strip().lower()
