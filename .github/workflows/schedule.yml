@@ -2,13 +2,18 @@ name: SpecCentr News Bot
 
 on:
   schedule:
-    # Каждый четверг в 9:00 по Москве (UTC+3 = 06:00 UTC)
+    # Каждый четверг в 9:00 по Москве (UTC+3 → 06:00 UTC)
     - cron: "0 6 * * 4"
-  workflow_dispatch:  # Ручной запуск из GitHub
+  workflow_dispatch:
 
 jobs:
-  fetch-news:
+  run-bot:
     runs-on: ubuntu-latest
+    # Запрещаем параллельный запуск — только один экземпляр одновременно
+    concurrency:
+      group: speccentr-bot
+      cancel-in-progress: false
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,7 +39,7 @@ jobs:
           key: db-${{ github.run_id }}
           restore-keys: db-
 
-      - name: Fetch news and send drafts to owner
+      - name: Fetch news + send drafts
         env:
           BOT_TOKEN:         ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID:        ${{ secrets.CHANNEL_ID }}
@@ -44,30 +49,7 @@ jobs:
           MAX_POSTS_PER_RUN: "3"
         run: python speccentr_news_bot.py fetch
 
-  poll-bot:
-    runs-on: ubuntu-latest
-    # poll запускается вместе с fetch — слушает кнопки 55 минут
-    needs: []
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Restore database
-        uses: actions/cache@v4
-        with:
-          path: news_bot.db
-          key: db-${{ github.run_id }}
-          restore-keys: db-
-
-      - name: Run bot polling (55 min)
+      - name: Poll for button presses (55 min)
         env:
           BOT_TOKEN:         ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID:        ${{ secrets.CHANNEL_ID }}
