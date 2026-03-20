@@ -42,9 +42,8 @@ except Exception:
 # ==============================================================
 # СПЕЦЦЕНТР NEWS BOT
 # Режимы:
-#   python speccentr_news_bot.py fetch  — найти новости через DuckDuckGo,
-#                                         написать статью через Claude,
-#                                         отправить владельцу на проверку
+#   python speccentr_news_bot.py fetch  — найти новости, написать статью
+#                                         через Claude, отправить владельцу
 #   python speccentr_news_bot.py poll   — слушать кнопки и заявки клиентов
 #   python speccentr_news_bot.py all    — fetch + poll одновременно
 # ==============================================================
@@ -68,6 +67,10 @@ CONTACT_TEXT      = os.getenv(
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("speccentr-bot")
 
+# Telegram ограничивает callback_data до 64 байт
+# "edit:" = 5 символов, остаётся 59 для hash
+HASH_LEN = 55  # pub: (4) + 55 = 59, edit: (5) + 55 = 60 — оба влезают
+
 
 # ==============================================================
 # ДАННЫЕ
@@ -81,17 +84,48 @@ class NewsItem:
     raw_text: str = ""
 
 
-# Поисковые запросы — по одному на каждую услугу
+# Запросы для DuckDuckGo
 SEARCH_QUERIES = [
-    "охрана труда изменения требования 2025 2026",
-    "пожарная безопасность новые требования 2025 2026",
-    "промышленная безопасность ростехнадзор 2025 2026",
-    "работы на высоте требования изменения 2025",
-    "СИЗ средства индивидуальной защиты требования 2025",
-    "первая помощь на производстве требования 2025",
-    "электробезопасность персонал требования 2025",
-    "газоопасные работы требования 2025",
-    "гражданская оборона ЧС требования 2025",
+    "охрана труда новые требования 2026",
+    "пожарная безопасность изменения 2026",
+    "промышленная безопасность ростехнадзор 2026",
+    "работы на высоте требования 2026",
+    "СИЗ индивидуальная защита требования 2026",
+    "первая помощь производство требования 2026",
+    "электробезопасность изменения 2026",
+    "охрана труда штрафы проверки 2026",
+]
+
+# Сайты для прямого парсинга
+HTML_SOURCES = [
+    {
+        "name": "Курсон / Охрана труда",
+        "url": "https://courson.ru/news/rubric/occupational-safety",
+        "item_selector": "a",
+        "href_must_contain": "/news/",
+        "base_url": "https://courson.ru",
+    },
+    {
+        "name": "Гарант / Новости ОТ",
+        "url": "https://www.garant.ru/news/tag/494/",
+        "item_selector": "a",
+        "href_must_contain": "/news/",
+        "base_url": "https://www.garant.ru",
+    },
+    {
+        "name": "Российская газета / Охрана труда",
+        "url": "https://rg.ru/tema/ekonomika/rabota/ohrana",
+        "item_selector": "a",
+        "href_must_contain": "/20",
+        "base_url": "https://rg.ru",
+    },
+    {
+        "name": "НАСО / Новости",
+        "url": "https://nasa24.ru/news",
+        "item_selector": "a",
+        "href_must_contain": "/news/",
+        "base_url": "https://nasa24.ru",
+    },
 ]
 
 SERVICE_RULES = [
@@ -163,8 +197,10 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
-def content_hash(title: str, url: str) -> str:
-    return hashlib.sha256(f"{title}|{url}".encode()).hexdigest()
+def make_hash(title: str, url: str) -> str:
+    """SHA256, обрезанный до HASH_LEN для совместимости с Telegram callback_data."""
+    full = hashlib.sha256(f"{title}|{url}".encode()).hexdigest()
+    return full[:HASH_LEN]
 
 def already_posted(conn, h):
     return conn.execute("SELECT 1 FROM published_news WHERE hash=?", (h,)).fetchone() is not None
@@ -259,138 +295,202 @@ def get_lead_topic(service: str) -> str:
 
 
 # ==============================================================
-# ПОИСК ЧЕРЕЗ DUCKDUCKGO
+# ПОЛУЧЕНИЕ ТЕКСТА СТРАНИЦЫ
+# ==============================================================
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+async def fetch_html(url: str, timeout: int = None) -> str:
+    t = aiohttp.ClientTimeout(total=timeout or FETCH_TIMEOUT)
+    try:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(url, timeout=t, allow_redirects=True,
+                                   ssl=False) as resp:
+                if resp.status != 200:
+                    logger.warning("HTTP %d: %s", resp.status, url)
+                    return ""
+                return await resp.text(errors="replace")
+    except Exception as e:
+        logger.warning("fetch_html %s: %s", url, e)
+        return ""
+
+
+def extract_text(html: str, max_len: int = 3000) -> str:
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script","style","noscript","nav","footer","header","aside"]):
+        tag.decompose()
+    return normalize(soup.get_text(" ", strip=True))[:max_len]
+
+
+# ==============================================================
+# ПОИСК ЧЕРЕЗ DUCKDUCKGO (GET запрос, правильные селекторы)
 # ==============================================================
 async def ddg_search(query: str, max_results: int = 5) -> List[dict]:
     """
-    Ищет через DuckDuckGo HTML (без API ключа).
-    Возвращает список {"title": ..., "url": ..., "snippet": ...}
+    Ищет через DuckDuckGo HTML версию (без API ключа, бесплатно).
+    Использует GET запрос — более стабильный чем POST.
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-    }
-    params = {"q": query, "kl": "ru-ru", "kad": "ru_RU"}
-    url = "https://html.duckduckgo.com/html/?" + urlencode(params)
+    params = urlencode({"q": query, "kl": "ru-ru", "kad": "ru_RU", "kp": "-2"})
+    url = f"https://html.duckduckgo.com/html/?{params}"
 
-    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.post(url, timeout=timeout) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
-    except Exception as e:
-        logger.warning("DuckDuckGo поиск '%s': %s", query, e)
+    html = await fetch_html(url, timeout=30)
+    if not html:
         return []
 
     soup = BeautifulSoup(html, "lxml")
     results = []
 
-    for result in soup.select(".result")[:max_results]:
-        title_el = result.select_one(".result__title a")
-        snippet_el = result.select_one(".result__snippet")
-        if not title_el:
+    # DDG HTML использует класс result__a для заголовков-ссылок
+    for a in soup.select("a.result__a")[:max_results * 2]:
+        title = normalize(a.get_text())
+        href = a.get("href", "")
+
+        # Извлекаем реальный URL из DDG редиректа
+        if "uddg=" in href:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(href).query)
+            href = qs.get("uddg", [""])[0]
+
+        if not title or not href or not href.startswith("http"):
             continue
 
-        title = normalize(title_el.get_text())
+        # Снипет — следующий элемент с классом result__snippet
+        snippet_el = a.find_next(class_="result__snippet")
         snippet = normalize(snippet_el.get_text()) if snippet_el else ""
 
-        # Извлекаем реальный URL из редиректа DDG
-        href = title_el.get("href", "")
-        if "uddg=" in href:
-            from urllib.parse import parse_qs, urlparse as _urlparse
-            qs = parse_qs(_urlparse(href).query)
-            href = qs.get("uddg", [href])[0]
-        elif href.startswith("/"):
-            href = "https://duckduckgo.com" + href
-
-        if not title or not href:
+        # Фильтруем мусорные домены
+        domain = urlparse(href).netloc.lower()
+        if any(skip in domain for skip in ["youtube","vk.com","ok.ru","instagram","facebook","tiktok"]):
             continue
 
         results.append({"title": title, "url": href, "snippet": snippet})
-
-    logger.info("DuckDuckGo '%s': найдено %d результатов", query, len(results))
-    return results
-
-
-async def fetch_article_text(url: str) -> str:
-    """Скачивает страницу и извлекает основной текст."""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=timeout,
-                                   allow_redirects=True) as resp:
-                if resp.status != 200:
-                    return ""
-                html = await resp.text(errors="replace")
-        soup = BeautifulSoup(html, "lxml")
-        for tag in soup(["script","style","noscript","nav","footer","header"]):
-            tag.decompose()
-        return normalize(soup.get_text(" ", strip=True))[:3000]
-    except Exception as e:
-        logger.warning("Не удалось прочитать %s: %s", url, e)
-        return ""
-
-
-async def collect_news() -> List[tuple]:
-    """
-    Ищет новости через DuckDuckGo по каждому запросу,
-    фильтрует по ключевым словам услуг.
-    """
-    seen_urls: set = set()
-    results: List[tuple] = []  # (NewsItem, service, tag, score)
-
-    for query in SEARCH_QUERIES:
-        hits = await ddg_search(query, max_results=5)
-        await asyncio.sleep(2)  # пауза между запросами чтобы не получить бан
-
-        for hit in hits:
-            url = hit["url"]
-            title = hit["title"]
-            snippet = hit["snippet"]
-
-            if not url or not title or url in seen_urls:
-                continue
-
-            # Фильтруем мусорные домены
-            domain = urlparse(url).netloc.lower()
-            if any(skip in domain for skip in ["youtube","vk.com","ok.ru","instagram","facebook"]):
-                continue
-
-            seen_urls.add(url)
-
-            # Быстрая проверка по заголовку и сниппету
-            service, tag, score = detect_service(f"{title} {snippet}")
-            if score < 5 or not service:
-                continue
-
-            # Читаем полный текст статьи
-            raw_text = await fetch_article_text(url)
-            if raw_text:
-                # Пересчитываем score с полным текстом
-                service, tag, score = detect_service(f"{title} {snippet} {raw_text}")
-                if score < 5 or not service:
-                    continue
-
-            item = NewsItem(
-                source=domain,
-                title=title,
-                url=url,
-                snippet=snippet,
-                raw_text=raw_text,
-            )
-            results.append((item, service, tag, score))
-
-        if len(results) >= MAX_POSTS_PER_RUN * 3:
+        if len(results) >= max_results:
             break
 
-    # Сортируем по score
-    results.sort(key=lambda p: p[3], reverse=True)
-    logger.info("Найдено релевантных новостей: %d", len(results))
+    logger.info("DuckDuckGo '%s': %d результатов", query[:40], len(results))
     return results
+
+
+# ==============================================================
+# ПАРСИНГ HTML ИСТОЧНИКОВ
+# ==============================================================
+async def parse_html_source(cfg: dict) -> List[NewsItem]:
+    logger.info("Парсю источник: %s", cfg["name"])
+    html = await fetch_html(cfg["url"])
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    items: List[NewsItem] = []
+    seen: set = set()
+
+    for a in soup.select(cfg["item_selector"]):
+        href = (a.get("href") or "").strip()
+        title = normalize(a.get_text(" ", strip=True))
+
+        if not href or not title or len(title) < 15:
+            continue
+        if cfg.get("href_must_contain") and cfg["href_must_contain"] not in href:
+            continue
+        if title in seen:
+            continue
+        seen.add(title)
+
+        # Строим полный URL
+        if href.startswith("http"):
+            full_url = href
+        elif href.startswith("/"):
+            full_url = cfg.get("base_url", "") + href
+        else:
+            continue
+
+        items.append(NewsItem(source=cfg["name"], title=title, url=full_url, snippet=""))
+        if len(items) >= 15:
+            break
+
+    # Читаем тексты статей
+    enriched = []
+    for item in items:
+        item.raw_text = extract_text(await fetch_html(item.url))
+        item.snippet = item.raw_text[:300]
+        enriched.append(item)
+        await asyncio.sleep(0.5)
+
+    logger.info("%s: найдено %d материалов", cfg["name"], len(enriched))
+    return enriched
+
+
+# ==============================================================
+# СБОР НОВОСТЕЙ
+# ==============================================================
+async def collect_news() -> List[tuple]:
+    seen_urls: set = set()
+    candidates: List[tuple] = []
+
+    # 1. Прямой парсинг добавленных источников
+    for cfg in HTML_SOURCES:
+        try:
+            items = await parse_html_source(cfg)
+            for item in items:
+                if item.url in seen_urls:
+                    continue
+                seen_urls.add(item.url)
+                service, tag, score = detect_service(
+                    f"{item.title} {item.snippet} {item.raw_text}"
+                )
+                if score >= 5 and service:
+                    candidates.append((item, service, tag, score))
+        except Exception as e:
+            logger.error("Ошибка источника %s: %s", cfg["name"], e)
+        await asyncio.sleep(1)
+
+    # 2. Поиск через DuckDuckGo
+    for query in SEARCH_QUERIES:
+        try:
+            hits = await ddg_search(query, max_results=5)
+            for hit in hits:
+                url = hit["url"]
+                if not url or url in seen_urls:
+                    continue
+
+                # Быстрая проверка по заголовку и сниппету
+                service, tag, score = detect_service(f"{hit['title']} {hit['snippet']}")
+                if score < 4:
+                    continue
+
+                seen_urls.add(url)
+                raw_text = extract_text(await fetch_html(url))
+                service, tag, score = detect_service(
+                    f"{hit['title']} {hit['snippet']} {raw_text}"
+                )
+                if score >= 5 and service:
+                    item = NewsItem(
+                        source=urlparse(url).netloc,
+                        title=hit["title"],
+                        url=url,
+                        snippet=hit["snippet"],
+                        raw_text=raw_text,
+                    )
+                    candidates.append((item, service, tag, score))
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error("DDG '%s': %s", query, e)
+        await asyncio.sleep(2)
+
+        if len(candidates) >= MAX_POSTS_PER_RUN * 4:
+            break
+
+    candidates.sort(key=lambda p: p[3], reverse=True)
+    logger.info("Релевантных новостей: %d", len(candidates))
+    return candidates
 
 
 # ==============================================================
@@ -478,10 +578,11 @@ async def regenerate_article(draft_article: str, service: str,
 # ==============================================================
 # КЛАВИАТУРЫ
 # ==============================================================
-def draft_keyboard(draft_hash: str) -> InlineKeyboardMarkup:
+def draft_keyboard(h: str) -> InlineKeyboardMarkup:
+    # h уже обрезан до HASH_LEN, pub:(4)+h и edit:(5)+h <= 64 байт
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"pub:{draft_hash}"),
-        InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{draft_hash}"),
+        InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"pub:{h}"),
+        InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{h}"),
     ]])
 
 def lead_keyboard(service: str) -> Optional[InlineKeyboardMarkup]:
@@ -516,26 +617,33 @@ async def run_fetch() -> None:
     conn = db_connect()
 
     try:
-        logger.info("Ищу новости через DuckDuckGo...")
+        logger.info("Ищу новости...")
         scored = await collect_news()
 
         sent = 0
         for item, service, tag, _score in scored:
-            h = content_hash(item.title, item.url)
+            h = make_hash(item.title, item.url)
             if already_posted(conn, h) or already_pending(conn, h):
                 continue
 
-            logger.info("Генерирую статью: %s", item.title)
+            logger.info("Генерирую статью: %s", item.title[:60])
             article = await generate_article(item, service)
             article_with_tag = f"{article}\n\n{tag} #спеццентр"
+
+            # Проверяем длину — Telegram лимит 4096 символов
+            if len(article_with_tag) > 3800:
+                article_with_tag = article_with_tag[:3797] + "..."
 
             preview = (
                 f"📰 <b>Черновик — проверьте перед публикацией</b>\n"
                 f"<b>Услуга:</b> {he(service)}\n"
                 f"<b>Источник:</b> <a href=\"{he(item.url)}\">{he(item.source)}</a>\n\n"
-                f"{'─' * 32}\n\n"
+                f"{'─' * 30}\n\n"
                 f"{article_with_tag}"
             )
+
+            if len(preview) > 4096:
+                preview = preview[:4093] + "..."
 
             if DRY_RUN:
                 logger.info("DRY RUN:\n%s", preview)
@@ -549,7 +657,7 @@ async def run_fetch() -> None:
                 )
                 save_draft(conn, h, article_with_tag, service, tag,
                            item.url, item.title, msg.message_id)
-                logger.info("Отправлено на проверку: %s (msg=%d)", item.title, msg.message_id)
+                logger.info("Отправлено на проверку: %s", item.title[:60])
 
             sent += 1
             if sent >= MAX_POSTS_PER_RUN:
@@ -576,7 +684,7 @@ async def start_polling() -> None:
     dp = Dispatcher()
     conn = db_connect()
 
-    # ---- Сброс вебхука при старте чтобы избежать Conflict ----
+    # Сброс вебхука и старых соединений при старте
     await bot.delete_webhook(drop_pending_updates=True)
 
     @dp.callback_query(F.data.startswith("pub:"))
@@ -584,7 +692,7 @@ async def start_polling() -> None:
         if str(callback.from_user.id) != OWNER_CHAT_ID:
             await callback.answer("Нет доступа.", show_alert=True)
             return
-        h = callback.data.split(":", 1)[1]
+        h = callback.data[4:]  # убираем "pub:"
         draft = get_draft(conn, h)
         if not draft:
             await callback.answer("Черновик не найден (уже опубликован?).", show_alert=True)
@@ -596,14 +704,14 @@ async def start_polling() -> None:
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.reply("✅ Опубликовано в канал!")
         await callback.answer()
-        logger.info("Опубликовано: %s", h[:12])
+        logger.info("Опубликовано: %s", h)
 
     @dp.callback_query(F.data.startswith("edit:"))
     async def cb_edit(callback: CallbackQuery) -> None:
         if str(callback.from_user.id) != OWNER_CHAT_ID:
             await callback.answer("Нет доступа.", show_alert=True)
             return
-        h = callback.data.split(":", 1)[1]
+        h = callback.data[5:]  # убираем "edit:"
         draft = get_draft(conn, h)
         if not draft:
             await callback.answer("Черновик не найден.", show_alert=True)
@@ -672,11 +780,15 @@ async def start_polling() -> None:
                 draft["article"], draft["service"], draft["source_url"], text
             )
             new_article_with_tag = f"{new_article}\n\n{draft['tag']} #спеццентр"
+            if len(new_article_with_tag) > 3800:
+                new_article_with_tag = new_article_with_tag[:3797] + "..."
             preview = (
                 f"📰 <b>Обновлённый черновик</b>\n"
                 f"<b>Услуга:</b> {he(draft['service'])}\n\n"
-                f"{'─' * 32}\n\n{new_article_with_tag}"
+                f"{'─' * 30}\n\n{new_article_with_tag}"
             )
+            if len(preview) > 4096:
+                preview = preview[:4093] + "..."
             new_msg = await message.answer(preview, reply_markup=draft_keyboard(h))
             update_draft(conn, h, new_article_with_tag, new_msg.message_id)
             user_states.pop(user_id, None)
