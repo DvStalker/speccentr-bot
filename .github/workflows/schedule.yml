@@ -2,14 +2,13 @@ name: SpecCentr News Bot
 
 on:
   schedule:
-    # Каждые 6 часов: 7:00, 13:00, 19:00, 01:00 (UTC+3 = UTC-3ч)
-    - cron: "0 4,10,16,22 * * *"
+    # Каждый четверг в 9:00 по Москве (UTC+3 = 06:00 UTC)
+    - cron: "0 6 * * 4"
   workflow_dispatch:  # Ручной запуск из GitHub
 
 jobs:
-  fetch-and-send:
+  fetch-news:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,19 +34,20 @@ jobs:
           key: db-${{ github.run_id }}
           restore-keys: db-
 
-      - name: Fetch news and send drafts
+      - name: Fetch news and send drafts to owner
         env:
-          BOT_TOKEN:          ${{ secrets.BOT_TOKEN }}
-          CHANNEL_ID:         ${{ secrets.CHANNEL_ID }}
-          OWNER_CHAT_ID:      ${{ secrets.OWNER_CHAT_ID }}
-          BOT_USERNAME:       ${{ secrets.BOT_USERNAME }}
-          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
-          MAX_POSTS_PER_RUN:  "3"
+          BOT_TOKEN:         ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID:        ${{ secrets.CHANNEL_ID }}
+          OWNER_CHAT_ID:     ${{ secrets.OWNER_CHAT_ID }}
+          BOT_USERNAME:      ${{ secrets.BOT_USERNAME }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MAX_POSTS_PER_RUN: "3"
         run: python speccentr_news_bot.py fetch
 
   poll-bot:
     runs-on: ubuntu-latest
-
+    # poll запускается вместе с fetch — слушает кнопки 55 минут
+    needs: []
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,10 +69,9 @@ jobs:
 
       - name: Run bot polling (55 min)
         env:
-          BOT_TOKEN:          ${{ secrets.BOT_TOKEN }}
-          CHANNEL_ID:         ${{ secrets.CHANNEL_ID }}
-          OWNER_CHAT_ID:      ${{ secrets.OWNER_CHAT_ID }}
-          BOT_USERNAME:       ${{ secrets.BOT_USERNAME }}
-          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          timeout 3300 python speccentr_news_bot.py poll || true
+          BOT_TOKEN:         ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID:        ${{ secrets.CHANNEL_ID }}
+          OWNER_CHAT_ID:     ${{ secrets.OWNER_CHAT_ID }}
+          BOT_USERNAME:      ${{ secrets.BOT_USERNAME }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: timeout 3300 python speccentr_news_bot.py poll || true
