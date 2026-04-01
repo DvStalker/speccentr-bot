@@ -53,6 +53,8 @@ CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "").strip()
 BOT_USERNAME  = os.getenv("BOT_USERNAME", "").strip()
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+# ID куда приходят заявки от клиентов (по умолчанию = владелец)
+LEADS_CHAT_ID = os.getenv("LEADS_CHAT_ID", "").strip() or os.getenv("OWNER_CHAT_ID", "").strip()
 
 DB_PATH           = os.getenv("DB_PATH", "news_bot.db")
 FETCH_TIMEOUT     = int(os.getenv("FETCH_TIMEOUT", "25"))
@@ -526,29 +528,39 @@ async def call_claude(prompt: str) -> str:
 
 async def generate_article(item: NewsItem, service: str) -> str:
     news_text = f"{item.title}\n\n{item.raw_text or item.snippet}"
-    prompt = f"""Ты контент-менеджер учебного центра «СпецЦентр» \
-(охрана труда, пожарная безопасность, промбезопасность).
+    prompt = f"""Ты опытный контент-маркетолог учебного центра «СпецЦентр» \
+(Липецк, охрана труда, пожарная безопасность, промбезопасность).
 
 Вот найденная новость:
 ---
 {news_text[:3000]}
 ---
 
-Напиши готовый пост для Telegram-канала. Требования:
-- Длина 150–300 слов
-- HTML-разметка Telegram: <b>, <i>, <a href="...">
-- Структура:
-  1. Цепляющий заголовок жирным
-  2. Суть новости — что изменилось или вводится
-  3. Кому важно (руководитель, специалист по ОТ, ответственный за безопасность)
-  4. Что нужно сделать — конкретный призыв проверить/пройти обучение
-  5. <a href="{he(item.url)}">Читать источник</a>
-- Актуальная услуга: {service}
-- В конце строго: 📩 <b>{he(CONTACT_TEXT)}</b>
-- Без хэштегов (добавятся автоматически)
-- Живо и по-деловому, без канцелярита
+Задача: переработай новость в продающий Telegram-пост для канала СпецЦентра.
 
-Верни ТОЛЬКО текст поста, без пояснений."""
+ОБЯЗАТЕЛЬНЫЕ ТРЕБОВАНИЯ:
+1. Сначала скорректируй и очисти исходную информацию — убери воду, оставь только факты
+2. Длина 150–250 слов
+3. HTML-разметка Telegram: <b>, <i>, <a href="...">
+
+СТРУКТУРА ПОСТА:
+1. 🔥 Цепляющий заголовок жирным — создай ощущение срочности или важности
+2. Факт: что именно изменилось/вступает в силу/грозит штрафом — конкретно
+3. Кому грозит проблема: руководитель, специалист по ОТ, ответственный за безопасность
+4. Последствия бездействия: штраф, проверка, несчастный случай, приостановка работ
+5. Решение: «СпецЦентр проведёт обучение по [услуга] — быстро, с документами»
+6. <a href="{he(item.url)}">Читать источник</a>
+
+ПРОДАЮЩИЕ ТЕХНИКИ:
+- Используй слова: «важно», «обязательно», «до [дата]», «штраф до N рублей», «проверят»
+- Создай ощущение что проблему легко решить именно через СпецЦентр
+- Призыв к действию: «Оставьте заявку прямо сейчас» или «Успейте пройти до проверки»
+
+АКТУАЛЬНАЯ УСЛУГА: {service}
+В КОНЦЕ СТРОГО: 📩 <b>{he(CONTACT_TEXT)}</b>
+БЕЗ ХЭШТЕГОВ (добавятся автоматически)
+
+Верни ТОЛЬКО текст поста, без пояснений и комментариев."""
     return await call_claude(prompt)
 
 
@@ -585,13 +597,23 @@ def draft_keyboard(h: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{h}"),
     ]])
 
-def lead_keyboard(service: str) -> Optional[InlineKeyboardMarkup]:
-    url = build_deep_link(service)
-    if not url:
-        return None
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Оставить заявку", url=url),
-    ]])
+def channel_post_keyboard(service: str) -> InlineKeyboardMarkup:
+    """Кнопки под каждым постом в канале."""
+    lead_url = build_deep_link(service)
+    rows = []
+    if lead_url:
+        rows.append([InlineKeyboardButton(text="📝 Оставить заявку", url=lead_url)])
+    rows.append([
+        InlineKeyboardButton(text="📞 Позвонить", url="tel:+74742377008"),
+        InlineKeyboardButton(text="🌐 Сайт", url="https://speccentr48.ru/"),
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            text="📍 Мы на карте",
+            url="https://yandex.ru/maps/?text=Липецк+Марины+Расковой+4+СпецЦентр",
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -697,7 +719,7 @@ async def start_polling() -> None:
         if not draft:
             await callback.answer("Черновик не найден (уже опубликован?).", show_alert=True)
             return
-        kb = lead_keyboard(draft["service"])
+        kb = channel_post_keyboard(draft["service"])
         await bot.send_message(chat_id=CHANNEL_ID, text=draft["article"], reply_markup=kb)
         mark_posted(conn, h, draft["source_title"], draft["source_url"], draft["service"])
         delete_draft(conn, h)
@@ -837,8 +859,8 @@ async def start_polling() -> None:
                 f"<b>Комментарий:</b> {he(text)}\n"
                 f"<b>Telegram:</b> @{he(message.from_user.username or '')} / {user_id}"
             )
-            if OWNER_CHAT_ID:
-                await bot.send_message(chat_id=OWNER_CHAT_ID, text=lead_text)
+            if LEADS_CHAT_ID:
+                await bot.send_message(chat_id=LEADS_CHAT_ID, text=lead_text)
             user_states.pop(user_id, None)
             await message.answer("Спасибо! Заявку получили. Свяжемся в ближайшее время.")
 
