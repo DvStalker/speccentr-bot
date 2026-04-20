@@ -9,7 +9,6 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    # Запрещаем параллельный запуск — только один экземпляр одновременно
     concurrency:
       group: speccentr-bot
       cancel-in-progress: false
@@ -32,14 +31,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore database
-        uses: actions/cache@v4
+      # Восстанавливаем БД из предыдущего запуска
+      - name: Download database
+        uses: actions/download-artifact@v4
         with:
-          path: news_bot.db
-          key: db-${{ github.run_id }}
-          restore-keys: db-
+          name: news-db
+          path: .
+        continue-on-error: true  # первый запуск — артефакта ещё нет
 
-      - name: Fetch news + send drafts
+      - name: Fetch news + send drafts to owner
         env:
           BOT_TOKEN:         ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID:        ${{ secrets.CHANNEL_ID }}
@@ -49,6 +49,15 @@ jobs:
           MAX_POSTS_PER_RUN: "3"
         run: python speccentr_news_bot.py fetch
 
+      # Сохраняем БД (с черновиками) ДО запуска poll
+      - name: Save database after fetch
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-db
+          path: news_bot.db
+          retention-days: 30
+          overwrite: true
+
       - name: Poll for button presses (55 min)
         env:
           BOT_TOKEN:         ${{ secrets.BOT_TOKEN }}
@@ -57,3 +66,13 @@ jobs:
           BOT_USERNAME:      ${{ secrets.BOT_USERNAME }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: timeout 3300 python speccentr_news_bot.py poll || true
+
+      # Сохраняем финальную БД (с отметками опубликованного)
+      - name: Save final database
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-db
+          path: news_bot.db
+          retention-days: 30
+          overwrite: true
+        if: always()
