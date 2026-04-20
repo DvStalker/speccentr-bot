@@ -711,31 +711,43 @@ async def start_polling() -> None:
 
     @dp.callback_query(F.data.startswith("pub:"))
     async def cb_publish(callback: CallbackQuery) -> None:
-        if str(callback.from_user.id) != OWNER_CHAT_ID:
+        user_id_str = str(callback.from_user.id)
+        logger.info("pub: нажал user_id=%s, OWNER_CHAT_ID=%s", user_id_str, OWNER_CHAT_ID)
+        if user_id_str != OWNER_CHAT_ID:
+            logger.warning("pub: отказ — не владелец (got %s, want %s)", user_id_str, OWNER_CHAT_ID)
             await callback.answer("Нет доступа.", show_alert=True)
             return
         h = callback.data[4:]  # убираем "pub:"
+        logger.info("pub: ищу черновик hash=%s", h)
         draft = get_draft(conn, h)
         if not draft:
+            logger.warning("pub: черновик не найден hash=%s", h)
             await callback.answer("Черновик не найден (уже опубликован?).", show_alert=True)
             return
-        kb = channel_post_keyboard(draft["service"])
-        await bot.send_message(chat_id=CHANNEL_ID, text=draft["article"], reply_markup=kb)
-        mark_posted(conn, h, draft["source_title"], draft["source_url"], draft["service"])
-        delete_draft(conn, h)
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.reply("✅ Опубликовано в канал!")
-        await callback.answer()
-        logger.info("Опубликовано: %s", h)
+        try:
+            kb = channel_post_keyboard(draft["service"])
+            await bot.send_message(chat_id=CHANNEL_ID, text=draft["article"], reply_markup=kb)
+            mark_posted(conn, h, draft["source_title"], draft["source_url"], draft["service"])
+            delete_draft(conn, h)
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.reply("✅ Опубликовано в канал!")
+            await callback.answer()
+            logger.info("pub: опубликовано успешно hash=%s", h)
+        except Exception as e:
+            logger.error("pub: ошибка публикации: %s", e)
+            await callback.answer(f"Ошибка: {e}", show_alert=True)
 
     @dp.callback_query(F.data.startswith("edit:"))
     async def cb_edit(callback: CallbackQuery) -> None:
-        if str(callback.from_user.id) != OWNER_CHAT_ID:
+        user_id_str = str(callback.from_user.id)
+        logger.info("edit: нажал user_id=%s", user_id_str)
+        if user_id_str != OWNER_CHAT_ID:
             await callback.answer("Нет доступа.", show_alert=True)
             return
         h = callback.data[5:]  # убираем "edit:"
         draft = get_draft(conn, h)
         if not draft:
+            logger.warning("edit: черновик не найден hash=%s", h)
             await callback.answer("Черновик не найден.", show_alert=True)
             return
         user_states[callback.from_user.id] = {"step": "editing", "draft_hash": h}
