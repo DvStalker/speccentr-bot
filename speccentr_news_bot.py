@@ -604,7 +604,8 @@ def channel_post_keyboard(service: str) -> InlineKeyboardMarkup:
     if lead_url:
         rows.append([InlineKeyboardButton(text="📝 Оставить заявку", url=lead_url)])
     rows.append([
-        InlineKeyboardButton(text="📞 Позвонить", url="tel:+74742377008"),
+        # Telegram принимает только http/https в inline-кнопках
+        InlineKeyboardButton(text="📞 Позвонить", url="https://t.me/+74742377008"),
         InlineKeyboardButton(text="🌐 Сайт", url="https://speccentr48.ru/"),
     ])
     rows.append([
